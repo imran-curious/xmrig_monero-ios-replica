@@ -1,12 +1,22 @@
-# Bare-metal Monero miner for iOS 26.5.1 — build plan
+# Bare-metal Monero miner for iOS 26.5.1 — build plan and build log
+
+> **Status: built, installed, and mining.** Measured **~3000 H/s** on a 6-core iPhone,
+> 12 GB RAM, iOS 26.5.1 (23F81), 2 threads, fast mode — against ~400 H/s on the
+> interpreter. Confirmed on-device 2026-09-17.
+>
+> This document was written *before* the build. Sections that the build proved wrong have
+> been corrected in place and marked as such rather than quietly deleted — **Part 3 was
+> substantially wrong** and is the most useful part of the record. Everything from Part 9
+> onward now reports outcomes instead of estimates.
 
 **Toolchain (fixed by you):** `xtool` under WSL for building and signing · `iLoader` + `SideStore` + `StikDebug` for installation and JIT on iPhone, iOS **26.5.1**.
 **Goal:** bare-metal miner — native arm64 hashing, no React Native, no JS bridge, no wrapper app around someone else's binary.
 
 Subject that prompted this: `D:\projects\miner_setup\phone\xmrig-for-android-v0.1.3-release.apk` (v0.1.3)
 Source tree: `D:\projects\miner_setup\phone\xmrig-for-android-main\` (upstream v0.1.4, MIT, Garry Lachman)
-Researched: 2026-09-17
+Researched: 2026-09-17 · Built and corrected: 2026-09-17
 
+---
 ---
 
 ## Part 1 — There is nothing to download; this has to be built
@@ -45,6 +55,7 @@ No `ios/ReactNativeXMRig/` app folder — no `AppDelegate`, no `Info.plist`, no 
 TrollStore tops out well below iOS 26. On **26.5.1** your only route to executable memory is a debugger attachment, i.e. StikDebug. That single fact drives most of the design below.
 
 ---
+---
 
 ## Part 2 — What the toolchain choice forces
 
@@ -72,83 +83,160 @@ Consequences worth noting: **no donate fee to patch out** (xmrig's 1% never ente
 Trade-off, stated plainly: you reimplement stratum login/job/submit and keepalive, roughly 400–600 lines across the Swift side. You give up xmrig's algo switching, HTTP API, config profiles and benchmark mode. For a single-algo miner on a phone, that is the right trade.
 
 ---
+---
 
-## Part 3 — The JIT problem, and why it is smaller than expected
+## Part 3 — The JIT problem (this section was wrong; corrected after the build)
 
-RandomX generates a fresh program per hash and JIT-compiles it. It needs memory that is both writable and executable. On iOS a normal process cannot have that; you need the `dynamic-codesigning` grant, which on 26.5.1 comes only from an attached debugger (`CS_DEBUGGED`), i.e. StikDebug.
+**What this section originally claimed:** that RandomX's `USE_PTHREAD_JIT_WP` macro is never
+defined under SwiftPM, so the portable `mmap` + `mprotect(PROT_EXEC)` path would hand us
+executable memory for free under `CS_DEBUGGED` — and therefore **zero modifications to
+RandomX**, "the single biggest simplification in this plan."
 
-**The good news:** RandomX already has a code path that is correct for this, and it is selected by a *build flag, not a source patch*.
+**That is false on iOS 26.** It was true up to roughly iOS 17. It cost more time than anything
+else in this project, so the correction is recorded in full.
 
-In `src/virtual_memory.c`, the macOS-specific behaviour is gated entirely on `USE_PTHREAD_JIT_WP`:
+### 3.1 Why `mprotect` is not enough on iOS 26
 
-```c
-#ifdef USE_PTHREAD_JIT_WP
-    #define MEXTRA MAP_JIT
-    #define PEXTRA PROT_EXEC
-#else
-    #define MEXTRA 0
-    #define PEXTRA 0
-#endif
-mem = mmap(NULL, bytes, PAGE_READWRITE | RESERVED_FLAGS | PEXTRA,
-           MAP_ANONYMOUS | MAP_PRIVATE | MEXTRA, -1, 0);
-```
+On A15+/M2+ under iOS 26, page permissions are no longer the kernel's to grant. Two monitors
+sit outside it:
 
-and likewise `setPagesRW` / `setPagesRX` use `pthread_jit_write_protect_np()` only under that macro, falling back to plain `mprotect()` otherwise.
+- **SPTM** (Secure Page Table Monitor) owns every page-table write.
+- **TXM** (Trusted Execution Monitor) owns code-signing and entitlement decisions.
 
-`MAP_JIT` and `pthread_jit_write_protect_np()` are the two things that do **not** work on iOS. RandomX's CMake defines `USE_PTHREAD_JIT_WP` when it detects Apple + arm64. **We are not using its CMake.** Under SwiftPM the macro is simply never defined, so we get the portable `mmap` + `mprotect` path for free — exactly the behaviour the hand-patched xmrig iOS forks achieve by editing source.
+`CS_DEBUGGED` is still set when a debugger attaches, and `mprotect(..., PROT_EXEC)` still
+**returns 0** — it just does not produce an executable page. The probe passes and the code
+faults on first call. That is the trap: a success return that means nothing.
 
-**Zero modifications to RandomX.** That is the single biggest simplification in this plan.
+Under iOS 26 the only mechanism that marks a page executable in a third-party process is an
+**out-of-process write by an attached debugger**. The process cannot bless its own memory
+under any entitlement a free account can obtain.
 
-Two supporting details confirmed in the source:
+### 3.2 The debugger arena (`brk #0xf00d`)
 
-- **icache correctness is handled.** `jit_compiler_a64.cpp` calls `__builtin___clear_cache()` itself after emitting code (three sites), so the non-`MAP_JIT` path does not produce stale-icache garbage on ARM64.
-- **Avoid `RANDOMX_FLAG_SECURE`.** With SECURE set, RandomX flips W^X on every program. Without it, `enableAll()` → `setPagesRWX()` maps the code region RWX **once** and never flips. On iOS that means exactly one privileged operation per VM, at creation, instead of millions.
+StikDebug's `universal.js` installs a `brk` handler. The app requests executable memory by
+trapping with arguments in registers:
 
-### 3.1 The JIT probe
+| `x16` | Request | Arguments |
+|---|---|---|
+| `0` | Detach | — |
+| `1` | Prepare region | `x0` = desired address or `NULL`, `x1` = length. **Returns the RX address in `x0`.** |
+| `2` | Inject extra handlers | — |
 
-Because one `mprotect(..., PROT_READ|PROT_WRITE|PROT_EXEC)` is the entire privileged surface, it is also a perfect pre-flight check. Probe it before touching RandomX:
+The region that comes back is **RX only**. To write into it, build a second, writable view of
+the *same physical pages* with `vm_remap` + `vm_protect`. `JitCompilerA64` then carries two
+pointers:
 
-```swift
-func jitAvailable() -> Bool {
-    let size = 4096
-    let p = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
-    guard let p, p != MAP_FAILED else { return false }
-    defer { munmap(p, size) }
-    return mprotect(p, size, PROT_READ | PROT_WRITE | PROT_EXEC) == 0
-}
-```
+- `code` — the RW alias, where instructions are emitted
+- `codeExec` — the RX address the debugger granted, where they are executed
 
-**The app must never assume JIT.** StikDebug attaches around launch, and the pairing/VPN can be in any state. Design the UI as a gate: `Waiting for JIT…` → poll the probe → only then build the RandomX VM. Without this the app simply crashes on a normal launch and you will waste time thinking the build is broken.
+`getProgramFunc()` returns `codeExec`, and `syncCode(begin, end)` publishes writes made through
+`code` to instruction fetch at `codeExec`. This works only because RandomX's generated code is
+fully PC-relative — nothing in it holds an absolute address of itself.
 
-Fallback if the probe fails: RandomX runs its interpreter, roughly **3–5 H/s versus 200+ H/s** with JIT. Surface which mode you are in on screen; do not silently mine at 1% speed.
+Implementation lives in `Sources/CRandomX/jit26_arena.{c,h}`, with `jit_compiler_a64.{cpp,hpp}`
+patched for the split views. **So RandomX is modified after all**, in exactly two files.
+`scripts/fetch-randomx.sh` now knows this and will not overwrite them.
 
+### 3.3 Arena invariants
+
+Each of these was learned by breaking it:
+
+- **Never unmap a granted region.** Once released it cannot be blessed again; the process is
+  stuck on the interpreter until relaunch.
+- **A `brk` with no listener kills the process.** Guarded with `sigaction(SIGTRAP)` plus
+  `sigsetjmp`/`siglongjmp`, so a missing debugger degrades to the interpreter instead of
+  crashing on launch.
+- **The debugger attaches *after* launch.** `universal.js` is not in place when `main()` runs,
+  so the first request retries for ~40 s before giving up.
+- **Do not poison the state on an early failure.** An arena status set before the debugger
+  check has run makes the later success invisible to the UI.
+- **Executability survives detach.** Once granted, pages stay executable even if the debugger
+  goes away — but a cold start must redo the whole handshake.
+
+### 3.4 The JIT probe, corrected
+
+The naive probe in the original plan returns `true` on iOS 26 while delivering nothing. What
+the app actually reports is arena state, from `rx_jit_arena_status()`:
+
+| Status | Meaning |
+|---|---|
+| 0 | Untried |
+| 1 | **JIT active** — the arena granted RX pages |
+| 2 | No debugger attached (`CS_DEBUGGED` clear) — the app was launched from its icon |
+| 3 | Debugger attached but `brk #0xf00d` went unanswered — no JIT script assigned |
+| 4 | Debugger answered but granted no region |
+| 5 | Region granted but the writable alias could not be built |
+
+Each maps to a line in the event log (`MiningEngine.jitStatusLine()`), so a failure is legible
+on screen instead of being inferred from a disappointing hashrate.
+
+**The app must never assume JIT.** The UI gates on it: `Waiting for JIT…` → poll → build the
+RandomX VM only once the arena is ready.
+
+**Measured fallback cost — not the estimate this plan originally carried.** The interpreter is
+not 3–5 H/s. On this hardware it is **~400 H/s**, against **~3000 H/s** with the arena: a
+**7.5x** gap, not 50x. Both figures on a 6-core iPhone, 12 GB RAM, iOS 26.5.1, 2 threads.
+
+Two claims from the original section did hold:
+
+- **Avoid `RANDOMX_FLAG_SECURE`.** With SECURE set, RandomX flips W^X per program, which the
+  split-view design cannot support at all.
+- **icache flushing is already handled.** `jit_compiler_a64.cpp` calls
+  `__builtin___clear_cache()` after emitting code; the patch reroutes those calls through
+  `syncCode()` so the flush lands on the executable view.
 ---
 
 ## Part 4 — Project shape
 
+Planned, and what it actually became:
+
 ```
-ios-miner/
+ios-replica/
   xtool.yml
   Package.swift
   App.entitlements
   Info.plist
-  scripts/fetch-randomx.sh      # clones tevador/RandomX, lays src/ into Sources/CRandomX/
+  LICENSE                       # MIT for this project's code
+  README.md
+  scripts/fetch-randomx.sh      # pulls tevador/RandomX; PRESERVES the files below
   Sources/
-    CRandomX/                   # C/C++ target: RandomX + a thin C shim
+    CRandomX/                   # C/C++ target: RandomX + shim + the iOS 26 arena
       include/rx_shim.h         #   the ONLY header Swift sees
+      include/randomx.h         #   forwarding shim
+      include/module.modulemap
       rx_shim.c
+      jit26_arena.c             #   brk #0xf00d handshake + vm_remap alias  <- ours
+      jit26_arena.h             #                                          <- ours
+      jit_compiler_a64.cpp      #   PATCHED for split RW/RX views          <- ours
+      jit_compiler_a64.hpp      #   PATCHED                                <- ours
+      LICENSE                   #   tevador, BSD 3-Clause
       <RandomX src/*>
-    Miner/                      # Swift: stratum, threads, governor, SwiftUI
+    Miner/                      # Swift
+      MoneroMinerApp.swift
+      ContentView.swift         #   hashrate, shares, JIT state, thermal, event log
+      MiningEngine.swift        #   @MainActor bridge, JIT polling, self-test
+      MinerCore.swift           #   thread pool, nonce partitioning, share submit
+      RandomXController.swift   #   cache/dataset lifecycle
+      JITProbe.swift
+      AudioKeeper.swift         #   silent-audio background mode
+      Models.swift              #   MiningConfig, LocalMiningStats
 ```
+
+**The six files marked `<- ours` are why `Sources/CRandomX/` is committed rather than
+gitignored, and why the fetch script stages upstream and drops those names before copying.
+Re-running the original version of that script silently reverted the JIT.**
 
 **`xtool.yml`** — confirmed key set is `version`, `bundleID`, `infoPath`, `entitlementsPath`, `iconPath`, `resources`:
 
 ```yaml
 version: 1
-bundleID: com.yourname.iosminer
+bundleID: com.monero.iosminer
+deploymentTarget: "17.0"
 infoPath: Info.plist
 entitlementsPath: App.entitlements
 ```
+
+`deploymentTarget` is also accepted and is worth setting explicitly.
 
 **Why the C shim.** RandomX's public API takes a C enum (`randomx_flags`) whose import into Swift is awkward to bit-OR. Rather than fight the Clang importer, expose a handful of `uint32_t`-flavoured functions from `rx_shim.h` (`rx_create`, `rx_vm_create`, `rx_hash`, `rx_destroy`) and keep every enum and opaque type on the C side. The shim is also the right home for the **multi-threaded dataset init** — `randomx_init_dataset` must be split across threads by item range or first-start takes minutes.
 
@@ -156,12 +244,15 @@ entitlementsPath: App.entitlements
 `jit_compiler_x86.cpp`, `jit_compiler_x86_static.S`, `jit_compiler_x86_static.asm`, `assembly_generator_x86.cpp`, `argon2_avx2.c`, `argon2_ssse3.c`, `asm/`, `cpu_rv64.S`, `jit_compiler_rv64*.{cpp,S}`, `aes_hash_rv64_*.cpp`, `tests/`.
 Also add `linkerSettings: [.linkedLibrary("c++")]`, and put a one-line forwarding header in `include/` so both `#include "randomx.h"` (internal) and the target's public headers resolve.
 
-**Things to verify on the first build**, rather than assume:
+**Things to verify on the first build** — and what they turned out to be:
 
-1. That `__ARM_FEATURE_CRYPTO` is defined for `arm64-apple-ios` so hardware AES is used. If `randomx_get_flags()` does not report `HARD_AES`, add `-mcpu=apple-a12` (or later) to `cxxSettings`.
-2. That excluding `assembly_generator_x86.cpp` does not break a reference in `randomx.cpp` — the arch guards should cover it; un-exclude if not.
-3. Whether the pool's algo is still `rx/0`. RandomX master now carries a `RANDOMX_FLAG_V2 = 128`. Read the algo from the stratum login response and set the flag from that rather than hardcoding.
+1. `__ARM_FEATURE_CRYPTO` for hardware AES. **Needed the nudge:** `-mcpu=apple-a12` is set in `cxxSettings` alongside `-O3`. Check `randomx_get_flags()` reports `HARD_AES`.
+2. Excluding `assembly_generator_x86.cpp` breaking a reference in `randomx.cpp`. **Fine** — the arch guards cover it.
+3. Whether the pool's algo is still `rx/0`. **It is.** `RANDOMX_FLAG_V2 = 128` exists but is not in play; still read the algo from the login response rather than hardcoding.
 
+The target also links `c++` and builds as `cxxLanguageStandard: .cxx14`, with `publicHeadersPath: "include"`.
+
+---
 ---
 
 ## Part 5 — The WSL build pipeline
@@ -185,38 +276,72 @@ swift sdk list       # expect: darwin
 ```bash
 xtool new Miner      # generate the template first, then graft in the layout from Part 4
 cd Miner
-xtool dev build      # output: ./xtool/Miner.app
+xtool dev build -c release --ipa    # output: ./xtool/MoneroMiner.ipa
 ```
+
+**`--ipa` does the packaging for you** — the manual `Payload/` + `zip` dance below turned out
+to be unnecessary, and hand-zipping is a good way to produce an IPA that installs but will not
+launch. Build release, not debug: a debug build of RandomX is not worth measuring.
 
 **Two install routes — you want the second:**
 
 - `xtool dev` builds, signs and installs straight over USB. Best for the edit/run loop while developing.
-- For **SideStore**, wrap the built bundle yourself:
+- For **SideStore**, install the `--ipa` output directly; SideStore re-signs with your own
+  certificate. (Only fall back to `mkdir -p Payload && cp -r xtool/Miner.app Payload/ &&
+  zip -r Miner.ipa Payload` if you have a bundle and no IPA.)
 
-```bash
-mkdir -p Payload && cp -r xtool/Miner.app Payload/ && zip -r Miner.ipa Payload
-```
-
-Then install `Miner.ipa` through SideStore, which re-signs with your own certificate.
-
-**Free-account limits that will bite:** 7-day certificate expiry (SideStore refreshes, but it must be able to reach your device), 3 sideloaded apps at a time, 10 App IDs per week. Also note xtool **prefixes your bundle ID** when signing (e.g. `XTL-1234.com.yourname.iosminer`) to avoid free-account collisions — expect the installed bundle ID not to match `xtool.yml` exactly.
+**Free-account limits that will bite:** 7-day certificate expiry (SideStore refreshes, but it must be able to reach your device), **3 sideloaded apps at a time — per *device*, not per Apple ID** (signing in with a second Apple ID does not buy three more slots; this was tested), 10 App IDs per week. Also note xtool **prefixes your bundle ID** when signing (e.g. `XTL-1234.com.yourname.iosminer`) to avoid free-account collisions — expect the installed bundle ID not to match `xtool.yml` exactly.
 
 ---
+---
 
-## Part 6 — JIT bring-up on 26.5.1
+## Part 6 — JIT bring-up on 26.5.1 (as actually performed)
 
-StikDebug supports iOS 17.4+ including 26.x. Three things are all mandatory:
+The original three-step version of this section was incomplete, and the step it omitted is the
+one that decides whether the miner runs at 400 or 3000 H/s.
 
-1. **Pairing file** — generated once on the PC with **iLoader** (or `idevicepair`). The StikDebug 3.1 branch **requires a freshly generated pairing file** on iOS 26.4+; an older file silently fails. Regenerate after any iOS update or device reset.
-2. **LocalDevVPN / StosVPN** — not optional. StikDebug will not function without the loopback VPN active.
-3. **StikDebug itself**, sideloaded alongside the miner.
+**What you need:**
 
-Routine use is then: open StikDebug → *Enable JIT* → pick the miner. Full PC setup recurs only when the pairing file expires.
+1. **A freshly generated pairing file.** StikDebug 3.1+ on iOS 26.4+ rejects an old one
+   *silently*. Regenerate after any iOS update or device reset.
+2. **StikDebug 3.1.10 or later**, sideloaded alongside the miner.
+3. **`universal.js`**, placed at On My iPhone → StikDebug → scripts (also reachable through
+   Settings → App Folder).
 
-Caveats specific to iOS 26: JIT on this branch is reported as fragile, with 26.6 and 27 working for only a few apps. **26.5.1 is inside the working window, but verify with a known-good JIT app (PPSSPP or Dolphin) before blaming your own build.** StikDebug's "Scripts" feature is called out as especially useful for iOS 26 JIT — worth reading if attachment is flaky.
+**VPN — the original plan was wrong here too.** It listed StosVPN / LocalDevVPN as mandatory.
+On this device it was not needed, and an active VPN actively broke the pool connection with
+`Network.NWError error 22` (`EINVAL`). Mining only worked with **all VPNs disabled**.
 
-Practical consequence for the app: **JIT does not survive relaunch.** Every cold start needs StikDebug again. Hence the wait-for-JIT gate in 3.1, and a strong reason to keep the app alive once it is running rather than restarting it.
+**StikDebug settings:** enable **Silent Audio**, **Background Location**, and **Always Run
+Scripts** ("Treats device as TXM-capable to bypass hardware checks"). The footer should read
+`Version 3.1.10 • iOS 26.5.1 • TXM (Override)`. Note that 3.1.10 has **no Picture in Picture
+toggle**, whatever older guides say.
 
+### 6.1 Assigning the script — the step nothing does for you
+
+StikDebug auto-assigns `universal.js` by matching a **hardcoded list of app display names**
+(`AutoScriptAssignments.swift`: Amethyst, MeloNX, XeniOS, MeloCafe, Manic EMU, DukeX, TachyonU,
+touchHLE, HyperHLE, Applesauce, RPCS3). **"Monero Miner" is on no list**, so it is assigned
+nothing, every `brk #0xf00d` goes unanswered, and the arena reports status 3 — which looks
+identical to a working app apart from the hashrate.
+
+Assign it by hand: **Apps tab → long-press the Monero Miner row → "Assign Script" → On My
+iPhone → StikDebug → scripts → `universal.js`**. The choice persists in `UserDefaults`
+(`bundleScriptMap`) but is lost if StikDebug is reinstalled.
+
+### 6.2 Launching
+
+**Launch the miner from StikDebug → Apps → Monero Miner. Every time.** Tapping the app's own
+home-screen icon produces a perfectly functional miner at **400 H/s**, with no error anywhere —
+it is simply running the interpreter. This is the single easiest thing to get wrong, and the
+symptom (a working app) gives nothing away.
+
+Confirm in the event log: `[jit] JIT ACTIVE via iOS 26 debugger arena (brk #0xf00d granted RX
+pages)`.
+
+**Correction to the original claim that "JIT does not survive relaunch":** granted pages stay
+executable even after the debugger detaches, so an already-running miner is safe. It is the
+*cold start* that needs StikDebug, because the handshake has to happen again.
 ---
 
 ## Part 7 — Runtime policy (this is where the hashrate actually comes from)
@@ -232,6 +357,12 @@ Decide at runtime, not at compile time: call **`os_proc_available_memory()`** an
 To raise the ceiling, try the **`com.apple.developer.kernel.increased-memory-limit`** entitlement (and possibly `extended-virtual-addressing`) in `App.entitlements`. **Open question to test early:** whether it survives. xtool's docs warn some entitlements do not work with free accounts, and separately, SideStore re-signs the IPA with its own profile — so an entitlement xtool applied may or may not persist through that. If it does not, `xtool dev` over USB may preserve it where SideStore does not. Establish this in Phase 1; the whole fast/light decision hangs on it.
 
 Dataset init is minutes single-threaded — always split `randomx_init_dataset` across all cores by item range.
+
+**Outcome:** the entitlements survived. `increased-memory-limit` and
+`extended-virtual-addressing` both held through signing and install, and **fast mode
+(2080 MB) runs** on a 12 GB device with no jetsam kill. The fast/light decision is still
+made at runtime from `os_proc_available_memory()`, but on this hardware it always lands on
+fast. Light mode remains the default until proven, which is the right way round.
 
 ### 7.2 Cores: QoS is the only lever
 
@@ -261,6 +392,7 @@ Your own notes already record the Android phone is **skin-temperature-throttle-b
 
 There is no legitimate background-execution mode for this. Android's foreground service — the thing your APK uses with `WAKE_LOCK` — has no iOS equivalent.
 
+---
 ---
 
 ## Part 8 — Stratum, since you are writing it yourself
@@ -292,68 +424,126 @@ Response carries `result.id` (the RPC session id used on submits) and `result.jo
            "nonce":"<8 hex, LE>","result":"<64 hex>"}}
 ```
 
+**Pool endpoint, learned the hard way:** `mine.c3pool.org` is dead. Use
+**`auto.c3pool.org:80`**. A `posix 22` / `NWError 22` on connect is almost always an active
+VPN rather than a pool or code problem — see Part 6. C3Pool's difficulty floor is 15000.
+
 Plus a `keepalived` call every ~60s, and reconnect-with-backoff on drop. Your existing C3Pool wallet address works unchanged — workers are just names, so give this one a distinct worker/rig id so it does not collide with `laptop`.
 
 ---
-
-## Part 9 — Phases
-
-| Phase | Work | Est. |
-|---|---|---|
-| 0 | WSL prerequisites: Swift 6.3, usbmuxd, USBIPD passthrough, Xcode 26 xip, `xtool setup`, `swift sdk list` shows `darwin`. Build and install the stock `xtool new` hello-world to the phone. **Do not proceed until a trivial app runs.** | 0.5–1 d |
-| 1 | JIT bring-up: iLoader pairing file, StosVPN, StikDebug. Ship an app that does nothing but run the Part 3.1 probe and display the result. Also test the `increased-memory-limit` entitlement here, via both `xtool dev` and SideStore. | 0.5 d |
-| 2 | RandomX as a SwiftPM target. Get `rx_shim` hashing and validate against RandomX's official test vectors on-device. This is the make-or-break phase. | 1–2 d |
-| 3 | Stratum client in Swift; log-only, no hashing. Confirm login, job receipt, keepalive, reconnect against the real pool. | 1 d |
-| 4 | Join them: thread pool, nonce partitioning, share submission. First accepted share. | 1 d |
-| 5 | Governor: QoS, thermal states, fast/light decision, dataset re-init on seed change. | 1 d |
-| 6 | Minimal SwiftUI: hashrate, accepted/rejected, JIT state, thermal state, mode (fast/light, JIT/interpreter). | 0.5 d |
-| 7 | Measure. Sustained rate over an hour, not burst. Compare against the Android phone. Tune thread count. | 0.5 d |
-| 8 | *Optional:* silent-audio background mode. | 0.5 d |
-
-**~7–9 working days solo**, assuming Phase 0 and Phase 1 behave. They are also the phases most likely to eat a day each on environment problems rather than code — USB passthrough and pairing files are where this stalls.
-
 ---
 
-## Part 10 — Risk register
+## Part 9 — Phases (all complete)
 
-| Risk | Where it bites | Mitigation |
-|---|---|---|
-| JIT unavailable or unstable on 26.5.1 | Everything. ~50x hashrate. | Phase 1, before any mining code. Validate StikDebug with PPSSPP first. |
-| USBIPD/usbmuxd flakiness in WSL | Phase 0, recurring | xtool's documented iTunes-relay workaround. |
-| `increased-memory-limit` stripped by SideStore re-signing | Forces light mode, ~10x | Test both install routes in Phase 1. Fall back to `xtool dev` over USB. |
-| Jetsam kill on dataset alloc | Crash on start | Gate on `os_proc_available_memory()`; light mode by default until proven. |
-| Algo is no longer `rx/0` | Invalid shares | Read algo from login response; set `RANDOMX_FLAG_V2` accordingly. |
-| 7-day cert expiry | App stops launching | SideStore refresh; keep the pairing file current. |
-| Thermal ceiling | Sustained rate far below burst | Phase 5 governor; measure over an hour. |
+| Phase | Work | Est. | Outcome |
+|---|---|---|---|
+| 0 | WSL prerequisites, `xtool setup`, hello-world on device | 0.5–1 d | Done. Xcode `.xip` download (~10 GB, browser only) dominated the time. |
+| 1 | JIT bring-up + entitlement test | 0.5 d | **Underestimated by a wide margin.** The `mprotect` assumption in Part 3 was wrong and had to be replaced with the debugger arena. Entitlements survived signing and install. |
+| 2 | RandomX as a SwiftPM target, validated against official test vectors | 1–2 d | Done, self-test passes for both interpreter and JIT modes. `-mcpu=apple-a12` was needed for hardware AES. |
+| 3 | Stratum client, log-only | 1 d | Done. Cost an extra cycle on the dead `mine.c3pool.org` endpoint and the VPN-induced `NWError 22`. |
+| 4 | Thread pool, nonce partitioning, first accepted share | 1 d | Done. |
+| 5 | Governor: QoS, thermal, fast/light, seed re-init | 1 d | Done. Fast mode confirmed working. |
+| 6 | SwiftUI: hashrate, shares, JIT state, thermal, mode | 0.5 d | Done, plus a six-state event log for arena diagnosis (3.4) — which paid for itself immediately. |
+| 7 | Measure sustained rate | 0.5 d | 400 H/s interpreter → **3000 H/s** with the arena. |
+| 8 | *Optional:* silent-audio background mode | 0.5 d | Implemented (`AudioKeeper.swift`). |
 
+**The estimate was ~7–9 days.** Phase 1 was the one that blew up, exactly as predicted — just
+for a different reason than predicted. The risk register called it "JIT unavailable or unstable
+on 26.5.1"; the reality was that JIT was available through a mechanism this document did not
+know existed.
 ---
 
-## Part 11 — Honest expectation
+## Part 10 — Risk register, settled
 
-You have decided to build it, so this is the last time it comes up. Foreground-only, screen-on, plugged-in, JIT re-armed after every launch, re-signed weekly, thermally capped — the sustained rate will be a fraction of what the Android phone already produces unattended, and the interesting part of this project is the port, not the XMR.
+| Risk | Predicted impact | What happened |
+|---|---|---|
+| JIT unavailable or unstable on 26.5.1 | Everything, ~50x | **Half right.** `mprotect` JIT is genuinely dead on iOS 26 — but the debugger arena works, and the real gap was 7.5x, not 50x. |
+| USBIPD/usbmuxd flakiness in WSL | Phase 0, recurring | Manageable. |
+| `increased-memory-limit` stripped by SideStore re-signing | Forces light mode, ~10x | **Did not happen.** Entitlements survived; fast mode runs. |
+| Jetsam kill on dataset alloc | Crash on start | **Did not happen** on 12 GB. The `os_proc_available_memory()` gate stays in. |
+| Algo is no longer `rx/0` | Invalid shares | Non-issue; `rx/0` still current. |
+| 7-day cert expiry | App stops launching | Unchanged and unavoidable on a free account. |
+| Thermal ceiling | Sustained rate far below burst | **The live constraint.** With the arena working, heat is now the ceiling — not the interpreter, not the config. |
+| *(unforeseen)* Script assignment | — | Not in the original register at all, and it is the most fragile part of the system: a StikDebug reinstall silently drops the miner to 400 H/s. See 6.1. |
+| *(unforeseen)* Launch path | — | Also absent. Launching from the home-screen icon costs 7.5x, with no error shown. See 6.2. |
+| *(unforeseen)* `fetch-randomx.sh` clobbering the patch | — | The script overwrote the two patched JIT files with upstream copies. Fixed; the fix is now tested. |
+---
 
-The upside of the design above is that it is small: roughly 600–900 lines of your own code, no CMake, no libuv, no OpenSSL, no source patches to RandomX, and no dev fee.
+## Part 11 — Honest expectation, revisited
 
+The original text said the interesting part of this project would be the port, not the XMR.
+That was right, and it is worth repeating now that it works: **~3000 H/s is not meaningful
+income.** It is a phone doing about what a single desktop core does, while getting hot.
+
+What the build actually cost, against the estimate: roughly the predicted amount of Swift and
+stratum code, plus an entire subsystem — the arena — that this plan did not anticipate because
+it assumed iOS 26 behaved like iOS 17.
+
+**What is fragile now**, in order of how easily it breaks:
+
+1. The **launch path** — must be StikDebug, every cold start (6.2).
+2. The **script assignment** — manual, and lost on StikDebug reinstall (6.1).
+3. The **pairing file** — must be regenerated after any iOS update (Part 6).
+4. The **7-day certificate** — re-sign weekly.
+
+**What the ceiling is now:** thermal. Same conclusion as the Android phone in the earlier
+notes, reached from the opposite direction — there the config was never the limit either.
+
+The design goal held up: no CMake, no libuv, no OpenSSL, no dev fee, and the only patched
+upstream files are the two the arena required.
 ---
 
 ## Appendix — evidence used
 
 ```bash
 # the APK is React Native + xmrig JNI, not Flutter
+
 unzip -l xmrig-for-android-v0.1.3-release.apk | grep -Ei 'xmrig|hermes|react'
 
 # the dead iOS scaffold
+
 ls -la xmrig-for-android-main/ios
 
 # the JIT gate is a build flag, not a patch
+# (true of RandomX's source; NOT sufficient on iOS 26 - see Part 3)
+
 curl -sL https://raw.githubusercontent.com/tevador/RandomX/master/src/virtual_memory.c \
   | grep -nE 'USE_PTHREAD_JIT_WP|MAP_JIT|mprotect'
 
 # icache flushing is already handled on arm64
+
 curl -sL https://raw.githubusercontent.com/tevador/RandomX/master/src/jit_compiler_a64.cpp \
   | grep -n clear_cache
 
 # xtool.yml schema and Linux setup
+
 curl -sL https://raw.githubusercontent.com/xtool-org/xtool/main/Documentation/xtool.docc/Control.md
 curl -sL https://raw.githubusercontent.com/xtool-org/xtool/main/Documentation/xtool.docc/Installation-Linux.md
 ```
+
+**Added after the build — the iOS 26 findings the research above did not surface:**
+
+```bash
+# the split RW/RX views that make the arena usable
+
+grep -n 'codeExec\|arenaBacked\|syncCode' Sources/CRandomX/jit_compiler_a64.hpp
+
+# the brk #0xf00d handshake
+
+grep -n '0xf00d\|vm_remap\|sigsetjmp' Sources/CRandomX/jit26_arena.c
+
+# the six arena states, and the log line for each
+
+grep -n 'RX_JIT26_' Sources/CRandomX/jit26_arena.h
+grep -n 'case [1-5]:' Sources/Miner/MiningEngine.swift
+
+# StikDebug's hardcoded auto-assign list - "Monero Miner" is not on it
+
+# (StikDebug source: Sources/.../AutoScriptAssignments.swift)
+
+```
+
+The two claims in the original appendix about `USE_PTHREAD_JIT_WP` and `mprotect` are still
+factually true about RandomX's source — they were just no longer sufficient on iOS 26. The
+error was not in reading the code; it was in assuming the kernel still had the final say over
+page permissions.
