@@ -1,0 +1,5 @@
+module CRandomX {
+    header "rx_shim.h"
+    header "randomx.h"
+    export *
+}
