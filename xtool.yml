@@ -1,0 +1,5 @@
+version: 1
+bundleID: com.monero.iosminer
+deploymentTarget: "17.0"
+infoPath: Info.plist
+entitlementsPath: App.entitlements
